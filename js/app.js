@@ -156,9 +156,9 @@ function recoverStall(t) {
     media.play().catch(() => { media.muted = true; media.play().catch(() => {}); });
   };
   media.addEventListener("loadedmetadata", onMeta);
-  /* 兜底：重连后 6 秒仍未真正开播（play 被拒/数据仍不通），交给看门狗的暂停救治路径 */
+  /* 兜底：重连后未真正开播（play 被拒/数据仍不通）→ 重置救治等级，交给看门狗暂停救治 */
   setTimeout(() => {
-    if (playing && media.paused) hardResume();
+    if (playing && media.paused) { pauseRescueTried = 0; hardResume(); }
   }, 6000);
 }
 
@@ -303,12 +303,17 @@ function prefetchUpcomingScenes(t) {
   }
 }
 
-/* ---------- 字幕条冻结帧：加载/换线期间用画布垫住下1/3，画面不缺角 ---------- */
+/* ---------- 字幕条冻结帧：加载/换线期间用画布垫住下1/3，画面不缺角 ----------
+   注意：drawImage 跨域视频会污染画布（画出来是空白且不报错），所以先用
+   captureStream 不现实；改为只在同源时绘制，跨域一律跳过（宁缺勿白板） */
 function freezeStripFrame(el) {
   if (!stripFreezeCv || !playerWrap.classList.contains("strip-mode")) return;
   try {
     const vw = el.videoWidth, vh = el.videoHeight;
     if (!vw || !vh) return;
+    /* 跨域视频：绘制会静默产出空白画布，直接放弃（避免白板盖住字幕） */
+    const u = new URL(el.currentSrc || el.src || "");
+    if (u.origin !== location.origin) return;
     stripFreezeCv.width = 854; stripFreezeCv.height = 160;
     const ctx = stripFreezeCv.getContext("2d");
     if (vh / vw > 0.21) {
@@ -318,8 +323,10 @@ function freezeStripFrame(el) {
       /* 已是条带视频：整幅 */
       ctx.drawImage(el, 0, 0, vw, vh, 0, 0, 854, 160);
     }
+    /* 防污染兜底：验一下真的画上了（污染画布 getImageData 会抛错） */
+    ctx.getImageData(0, 0, 1, 1);
     stripFreezeCv.hidden = false;
-  } catch (e) { /* 跨域画布污染等：忽略，退回原有表现 */ }
+  } catch (e) { /* 污染/异常：隐藏画布，宁缺勿白板 */ try { stripFreezeCv.hidden = true; } catch (e2) {} }
 }
 function clearStripFreeze() { if (stripFreezeCv) stripFreezeCv.hidden = true; }
 
@@ -714,8 +721,15 @@ function onMediaEvent(el) {
     playerWrap.classList.add("started"); /* 真正出画面：待机黄底此刻才淡出 */
     setBuffering(false);
     startBtn.hidden = true;
+    pauseRescueTried = 0; /* 恢复正常播放：重置救治等级 */
     playerWrap.classList.remove("preload-visual"); /* 正式开场：字幕/光芒/推镜一起启动 */
     if (!currentSlot || !currentSlot.audio) loadStandbyNext(); /* 开播即让后台预载下段 */
+  });
+  /* 冻结帧保险丝：条带模式下前台视频在走而画布还盖着 → 撤掉 */
+  el.addEventListener("timeupdate", () => {
+    if (media === el && stripFreezeCv && !stripFreezeCv.hidden && !el.paused && el.currentTime > 0.5) {
+      clearStripFreeze();
+    }
   });
   el.addEventListener("canplay", () => { if (media === el) setBuffering(false); });
 }
