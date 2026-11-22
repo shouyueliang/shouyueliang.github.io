@@ -101,6 +101,7 @@ function mediaUrl(rel) {
    ② 播放中却处于暂停态（play被拒等）→ 自动续播，失败降级静音续播，再失败给手动按钮 */
 let stallTicks = []; /* [{t:墙钟ms, p:播放位置}] 滑动窗口 */
 let pauseRescueTried = 0;
+let starveStarted = 0; /* readyState<3（断粮）起始时刻 */
 function hardResume() {
   if (pauseRescueTried === 0) {
     media.play().catch(() => {});
@@ -114,7 +115,7 @@ function hardResume() {
   pauseRescueTried += 1;
 }
 setInterval(() => {
-  if (!playing) { stallTicks = []; pauseRescueTried = 0; return; }
+  if (!playing) { stallTicks = []; pauseRescueTried = 0; starveStarted = 0; return; }
   if (!media.src) { stallTicks = []; return; }
   if (media.ended) { stallTicks = []; return; }
   /* 救治异常暂停：播放会话中不应长时间暂停 */
@@ -123,6 +124,16 @@ setInterval(() => {
     return;
   }
   pauseRescueTried = 0;
+  /* waiting/stalled 但未暂停（readyState<3 且缓冲耗尽）：计时，10 秒仍无数据也换线 */
+  const starving = media.readyState < 3;
+  if (starving && !starveStarted) starveStarted = Date.now();
+  if (!starving) starveStarted = 0;
+  if (starving && Date.now() - starveStarted > 10000) {
+    starveStarted = 0;
+    stallTicks = [];
+    recoverStall(media.currentTime);
+    return;
+  }
   const now = Date.now();
   const p = media.currentTime;
   stallTicks.push({ t: now, p });
@@ -160,6 +171,14 @@ function recoverStall(t) {
   setTimeout(() => {
     if (playing && media.paused) { pauseRescueTried = 0; hardResume(); }
   }, 6000);
+  /* 终极兜底：换线后 25 秒仍没走出卡点（数据还没到播放位置）→ 再换下一条线重试，
+     看门狗会因进度停滞再次触发本函数，形成"循环换线直到通"的效果 */
+  setTimeout(() => {
+    if (playing && !media.paused && media.currentTime < t + 2) {
+      stallTicks = [];
+      recoverStall(media.currentTime);
+    }
+  }, 25000);
 }
 
 /* ---------- 时间工具 ---------- */
