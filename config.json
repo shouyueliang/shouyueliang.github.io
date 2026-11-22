@@ -7,22 +7,28 @@
       "time": "05:30",
       "videos": [
         "test-media/am-i0.mp4",
-        "test-media/ams-p0.mp4",
-        "test-media/ams-p1.mp4",
-        "test-media/ams-p2.mp4",
+        "test-media/am-s00.mp4",
+        "test-media/am-s01.mp4",
+        "test-media/am-s02.mp4",
+        "test-media/am-s03.mp4",
+        "test-media/am-s04.mp4",
+        "test-media/am-s05.mp4",
         "test-media/am-e3.mp4"
       ],
       "durationSec": 3738.13,
       "partDurations": [
         75.0,
-        1308.77,
-        1311.42,
-        923.43,
+        601.36,
+        707.56,
+        604.33,
+        707.23,
+        603.5,
+        320.08,
         119.86
       ],
       "stripBg": "test-media/am-bg.jpg",
       "stripFrom": 1,
-      "stripTo": 3
+      "stripTo": 6
     },
     {
       "id": "pm",
@@ -30,28 +36,38 @@
       "time": "20:00",
       "videos": [
         "test-media/pm-i0.mp4",
-        "test-media/pms-p0.mp4",
-        "test-media/pms-p1.mp4",
-        "test-media/pms-p2.mp4",
-        "test-media/pms-p3.mp4",
-        "test-media/pms-p4.mp4",
-        "test-media/pms-p5.mp4",
+        "test-media/pm-s00.mp4",
+        "test-media/pm-s01.mp4",
+        "test-media/pm-s02.mp4",
+        "test-media/pm-s03.mp4",
+        "test-media/pm-s04.mp4",
+        "test-media/pm-s05.mp4",
+        "test-media/pm-s06.mp4",
+        "test-media/pm-s07.mp4",
+        "test-media/pm-s08.mp4",
+        "test-media/pm-s09.mp4",
+        "test-media/pm-s10.mp4",
         "test-media/pm-e4.mp4"
       ],
       "durationSec": 7352.8,
       "partDurations": [
         90.1,
-        1309.05,
-        1303.28,
-        1304.18,
-        1303.19,
-        1303.18,
-        621.17,
+        620.45,
+        688.8,
+        615.48,
+        687.96,
+        615.38,
+        688.99,
+        614.29,
+        689.07,
+        615.68,
+        687.67,
+        621.36,
         119.8
       ],
       "stripBg": "test-media/pm-bg.jpg",
       "stripFrom": 1,
-      "stripTo": 6
+      "stripTo": 11
     }
   ],
   "mirrors": [
