@@ -100,11 +100,33 @@ function mediaUrl(rel) {
   return new URL(rel, b + "/").href;
 }
 
-/* ---------- 卡死/龟速自愈看门狗：完全停顿>10s，或30s内进度<5s（龟速）→ 换线路重连续播 ---------- */
+/* ---------- 卡死/龟速/静默暂停 自愈看门狗 ----------
+   ① 30s 窗口进度<5s（龟速/停顿）→ 换线路重连续播
+   ② 播放中却处于暂停态（play被拒等）→ 自动续播，失败降级静音续播，再失败给手动按钮 */
 let stallTicks = []; /* [{t:墙钟ms, p:播放位置}] 滑动窗口 */
+let pauseRescueTried = 0;
+function hardResume() {
+  if (pauseRescueTried === 0) {
+    media.play().catch(() => {});
+  } else if (pauseRescueTried === 1) {
+    media.muted = true;
+    updateMuteBadge();
+    media.play().then(() => showToast("已恢复播放（静音），点击画面开声音", "info", 4000)).catch(() => {});
+  } else {
+    startBtn.hidden = false; /* 彻底被禁：手动按钮兜底 */
+  }
+  pauseRescueTried += 1;
+}
 setInterval(() => {
-  if (!playing) { stallTicks = []; return; }
-  if (media.paused || media.ended || !media.src) { stallTicks = []; return; }
+  if (!playing) { stallTicks = []; pauseRescueTried = 0; return; }
+  if (!media.src) { stallTicks = []; return; }
+  if (media.ended) { stallTicks = []; return; }
+  /* 救治异常暂停：播放会话中不应长时间暂停 */
+  if (media.paused) {
+    if (pauseRescueTried <= 3) hardResume();
+    return;
+  }
+  pauseRescueTried = 0;
   const now = Date.now();
   const p = media.currentTime;
   stallTicks.push({ t: now, p });
@@ -138,6 +160,10 @@ function recoverStall(t) {
     media.play().catch(() => { media.muted = true; media.play().catch(() => {}); });
   };
   media.addEventListener("loadedmetadata", onMeta);
+  /* 兜底：重连后 6 秒仍未真正开播（play 被拒/数据仍不通），交给看门狗的暂停救治路径 */
+  setTimeout(() => {
+    if (playing && media.paused) hardResume();
+  }, 6000);
 }
 
 /* ---------- 时间工具 ---------- */
@@ -465,7 +491,7 @@ function loadStandbyNext(force = false) {
   if (standbyArmedIdx === queueIndex) return; /* 本段已预载过 */
   if (!force) {
     if (!isFinite(media.duration)) return;
-    if (media.duration - media.currentTime > 90) return; /* 未到预载窗口：先让前台独占带宽 */
+    if (media.duration - media.currentTime > 150) return; /* 未到预载窗口：先让前台独占带宽（拥塞线路需要更长预热） */
   }
   standbyArmedIdx = queueIndex;
   const url = mediaUrl(next);
