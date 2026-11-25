@@ -6,14 +6,14 @@
       "name": "早课",
       "time": "05:30",
       "videos": [
-        "test-media/am-i0.mp4",
+        "test-media/am-i0b.mp4",
         "test-media/am-s00.mp4",
         "test-media/am-s01.mp4",
         "test-media/am-s02.mp4",
         "test-media/am-s03.mp4",
         "test-media/am-s04.mp4",
         "test-media/am-s05.mp4",
-        "test-media/am-e3.mp4"
+        "test-media/am-e3b.mp4"
       ],
       "durationSec": 3738.13,
       "partDurations": [
@@ -35,7 +35,7 @@
       "name": "晚课",
       "time": "20:00",
       "videos": [
-        "test-media/pm-i0.mp4",
+        "test-media/pm-i0b.mp4",
         "test-media/pm-s00.mp4",
         "test-media/pm-s01.mp4",
         "test-media/pm-s02.mp4",
@@ -47,7 +47,7 @@
         "test-media/pm-s08.mp4",
         "test-media/pm-s09.mp4",
         "test-media/pm-s10.mp4",
-        "test-media/pm-e4.mp4"
+        "test-media/pm-e4b.mp4"
       ],
       "durationSec": 7352.8,
       "partDurations": [

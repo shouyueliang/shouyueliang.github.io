@@ -4,8 +4,8 @@
    - 支持两种场次模式（config.json）：
      · 音频+图片：{ audio, scenes:[{t,img}] }  ← 推荐，秒开、可精准同步
      · 视频：     { videos:[...] }（多段连播，兼容保留）
-   - 直播式同步：任何人任意时刻打开，进度 = 当前时间 - 开播时间，
-     与所有人一致；播放中每 15 秒校准一次防漂移
+   - 直播式同步：任何人任意时刻打开，进度 = 当前时间 - 开播时间，与所有人一致；
+     播放中持续向统一进度靠拢，但只在"目标位置已经缓冲好"时才往前跳，不为同步而打断播放
    - 配置优先读线上 config.json，失败用内置默认
    ========================================================== */
 "use strict";
@@ -14,12 +14,12 @@
 const DEFAULT_SCHEDULE = [
   {
     id: "am", name: "早课", time: "05:30",
-    videos: ["test-media/am-i0.mp4"],
+    videos: ["test-media/am-i0b.mp4"],
     durationSec: 3738.13,
   },
   {
     id: "pm", name: "晚课", time: "20:00",
-    videos: ["test-media/pm-i0.mp4"],
+    videos: ["test-media/pm-i0b.mp4"],
     durationSec: 7352.8,
   },
 ];
@@ -82,57 +82,103 @@ function mediaUrl(rel) {
   return new URL(rel, location.origin + "/").href;
 }
 
-/* ---------- 卡死/龟速/静默暂停 自愈看门狗 ----------
-   ① 30s 窗口进度<5s（龟速/停顿）→ 原地址重连续播
-   ② 播放中却处于暂停态（play被拒等）→ 自动续播，失败降级静音续播，再失败给手动按钮 */
+/* ---------- 卡死/龟速/异常暂停 自愈看门狗（每 2 秒巡检一次） ----------
+   判定"卡死"看的是数据而不是固定的秒数：只要数据还在陆续到达（哪怕慢网正在读视频头）
+   就不算卡死，不去打断它，避免"越救越卡"。
+   ① 缓冲耗尽时：一个字节都没收到(起播 6 秒/其余 12 秒)，或下载速度不到播放所需的一半且持续 20 秒
+      → 换一条新连接续播；速度够（哪怕慢）就耐心等，不打断
+   ② 30 秒内进度不足 5 秒（龟速/反复停顿） → 同上
+   ③ 播放会话中却处于暂停态 → 自动续播；数据明明就绪却连续 10 秒播不了 → 给手动按钮 */
 let stallTicks = []; /* [{t:墙钟ms, p:播放位置}] 滑动窗口 */
 let pauseRescueTried = 0;
-let starveStarted = 0; /* readyState<3（断粮）起始时刻 */
-function hardResume() {
-  if (pauseRescueTried === 0) {
-    media.play().catch(() => {});
-  } else if (pauseRescueTried === 1) {
-    media.muted = true;
-    updateMuteBadge();
-    media.play().then(() => showToast("已恢复播放（静音），点击画面开声音", "info", 4000)).catch(() => {});
-  } else {
-    startBtn.hidden = false; /* 彻底被禁：手动按钮兜底 */
+let starveStarted = 0; /* 本轮"缓冲耗尽"的起始时刻（ms），0 表示未耗尽 */
+let lastDataAt = 0;    /* 前台播放器最近一次收到媒体数据的时刻（ms） */
+const STARVE_SILENT_MS = 12000; /* 缓冲耗尽后"完全没有数据"多久，判定这条连接已死 */
+const STARVE_SLOW_RATE = 0.5;   /* 下载速度（每秒下到多少秒的视频）低于它，播起来也会一直卡 */
+const STARVE_SLOW_MS = 15000;   /* 速度一直这么慢持续多久，就换条连接试试 */
+let errRetries = 0;    /* 连续加载出错的次数（恢复播放后清零） */
+let joinPending = false;      /* 正在进场定位（还没出第一帧）：此期间同步逻辑不插手 */
+let firstByteWaitMs = 6000;   /* 起播时"一个字节都没收到"等多久就换连接；连续失败会逐步放宽 */
+let slowSince = 0;             /* 下载速度持续偏慢的起始时刻（ms），0 表示不慢 */
+const bufHist = [];            /* 最近十几秒「巡检时刻 → 已缓冲视频秒数」，用来估下载速度 */
+
+/* 让播放器播起来。只有浏览器策略明确拒绝"有声自动播放"(NotAllowedError) 才降级为静音；
+   其它失败（换源被中断 AbortError 等）不动声音，交给看门狗下一轮重试 */
+function ensurePlaying(el) {
+  if (!el || !el.src || el.ended || !el.paused) return;
+  const p = el.play();
+  if (p && typeof p.catch === "function") {
+    p.catch((err) => {
+      if (err && err.name === "NotAllowedError" && !el.muted) {
+        el.muted = true;
+        if (el === media) updateMuteBadge();
+        el.play().catch(() => {});
+      }
+    });
   }
-  pauseRescueTried += 1;
+}
+/* 播放器里已缓冲的视频总秒数 */
+function bufferedTotalSec(el) {
+  let tot = 0;
+  try { const b = el.buffered; for (let i = 0; i < b.length; i++) tot += b.end(i) - b.start(i); } catch (e) {}
+  return tot;
 }
 setInterval(() => {
-  if (!playing) { stallTicks = []; pauseRescueTried = 0; starveStarted = 0; return; }
-  if (!media.src) { stallTicks = []; return; }
-  if (media.ended) { stallTicks = []; return; }
-  /* 救治异常暂停：播放会话中不应长时间暂停 */
+  if (!playing) { stallTicks = []; pauseRescueTried = 0; starveStarted = 0; slowSince = 0; return; }
+  if (!media.src || media.ended) { stallTicks = []; starveStarted = 0; return; }
+  /* ③ 异常暂停：播放会话中不应长时间处于暂停态 */
   if (media.paused) {
-    if (pauseRescueTried <= 3) hardResume();
+    pauseRescueTried += 1;
+    if (pauseRescueTried <= 5) { ensurePlaying(media); }
+    else if (media.readyState >= 2) { startBtn.hidden = false; } /* 数据已就绪却 10 秒播不了：手动兜底 */
     return;
   }
   pauseRescueTried = 0;
-  /* waiting/stalled 但未暂停（readyState<3 且缓冲耗尽）：计时，10 秒仍无数据也重连 */
-  const starving = media.readyState < 3;
-  if (starving && !starveStarted) starveStarted = Date.now();
-  if (!starving) starveStarted = 0;
-  if (starving && Date.now() - starveStarted > 10000) {
-    starveStarted = 0;
-    stallTicks = [];
-    recoverStall(media.currentTime);
-    return;
-  }
   const now = Date.now();
+  /* ① 缓冲耗尽（readyState<3）：按"还有没有数据在到"来计时，而不是固定 10 秒 */
+  const starving = media.readyState < 3;
+  if (starving) {
+    if (!starveStarted) { starveStarted = now; slowSince = 0; bufHist.length = 0; }
+    const silentFor = now - Math.max(starveStarted, lastDataAt);
+    /* 连视频头都还没收到：多半是这条请求挂了（换一条连接通常立刻就有响应） */
+    const nothingYet = media.readyState < 1 && now - lastDataAt > firstByteWaitMs;
+    /* 下载速度（每秒下到多少秒的视频），按最近 12 秒的平均值估，免得被一阵一阵的到数据误判；
+       不到播放所需的一半、还一直这样 → 这条连接太慢，换一条试试 */
+    const bufNow = bufferedTotalSec(media);
+    bufHist.push({ t: now, sec: bufNow });
+    while (bufHist.length > 1 && now - bufHist[0].t > 12000) bufHist.shift();
+    const rate = (bufNow - bufHist[0].sec) / Math.max(1, (now - bufHist[0].t) / 1000);
+    if (rate < STARVE_SLOW_RATE) { if (!slowSince) slowSince = now; } else slowSince = 0;
+    if (nothingYet || silentFor > STARVE_SILENT_MS || (slowSince && now - slowSince > STARVE_SLOW_MS)) {
+      if (nothingYet) firstByteWaitMs = Math.min(firstByteWaitMs * 2, 24000); /* 连续失败就放宽，避免反复空等 */
+      starveStarted = 0;
+      slowSince = 0;
+      stallTicks = [];
+      recoverStall(media.currentTime);
+      return;
+    }
+  } else {
+    starveStarted = 0;
+    slowSince = 0;
+  }
+  /* ② 30 秒只走了不到 5 秒：龟速/反复停顿，换连接 */
   const p = media.currentTime;
   stallTicks.push({ t: now, p });
   while (stallTicks.length && now - stallTicks[0].t > 30500) stallTicks.shift();
   const first = stallTicks[0];
-  const spanMs = now - first.t;
-  const prog = p - first.p;
-  if (spanMs >= 30000 && prog < 5) { /* 30 秒只走了不到 5 秒：龟速/停顿，重连 */
+  if (now - first.t >= 30000 && p - first.p < 5) {
     stallTicks = [];
     recoverStall(p);
   }
 }, 2000);
 function recoverStall(t) {
+  const wasJoining = joinPending;
+  joinPending = true; /* 重新加载并定位期间位置会短暂归零，同步逻辑先不插手 */
+  /* 进场阶段还没出过画面就重连：要回到的是"当前的直播位置"，而不是卡住的位置（此时还是 0） */
+  if (wasJoining && liveMode && currentSlot && currentSlot.partDurations) {
+    const loc = locateInQueue((Date.now() - sessionStartMs) / 1000);
+    if (loc.idx === queueIndex) t = loc.offset;
+  }
   /* 中止预滚/待命，避免旧连接残留 */
   prerollOn = false;
   clearInterval(prerollWatchTimer);
@@ -140,28 +186,22 @@ function recoverStall(t) {
   try { standbyEl.pause(); } catch (e) {}
   freezeStripFrame(media); /* 垫住字幕条，重连期间画面完整 */
   /* 原地址重连：只走本站（GitHub），不换线、不带防缓存参数 */
-  const wasMuted = media.muted;
   const url = mediaUrl(queue[queueIndex] || (currentSlot && currentSlot.videos && currentSlot.videos[0]) || "");
+  lastDataAt = Date.now(); /* 重新计时：从这次重连算起，看数据还到不到 */
+  starveStarted = 0;
+  bufHist.length = 0;
   media.src = url;
   const onMeta = () => {
     media.removeEventListener("loadedmetadata", onMeta);
     try { media.currentTime = Math.min(t, Math.max(0, (isFinite(media.duration) ? media.duration : t) - 0.3)); } catch (e) {}
-    media.muted = wasMuted;
-    media.play().catch(() => { media.muted = true; media.play().catch(() => {}); });
+    ensurePlaying(media);
   };
   media.addEventListener("loadedmetadata", onMeta);
-  /* 兜底：重连后未真正开播（play 被拒/数据仍不通）→ 重置救治等级，交给看门狗暂停救治 */
+  /* 兜底：重连后仍处于暂停态 → 重置救治计数，交给看门狗继续续播 */
   setTimeout(() => {
-    if (playing && media.paused) { pauseRescueTried = 0; hardResume(); }
+    if (playing && media.paused) { pauseRescueTried = 0; ensurePlaying(media); }
   }, 6000);
-  /* 终极兜底：重连后 25 秒仍没走出卡点（数据还没到播放位置）→ 再重连一次，
-     看门狗会因进度停滞再次触发本函数，形成"循环重连直到通"的效果 */
-  setTimeout(() => {
-    if (playing && !media.paused && media.currentTime < t + 2) {
-      stallTicks = [];
-      recoverStall(media.currentTime);
-    }
-  }, 25000);
+  /* 之后若仍卡住，由看门狗按"有没有数据 / 下载速度"决定是否再换连接（见上方规则①②） */
 }
 
 /* ---------- 时间工具 ---------- */
@@ -365,6 +405,7 @@ async function startPlay(slot, opts = {}) {
   playerWrap.classList.add("playing");
   queue = [];
   queueIndex = 0;
+  joinPending = false;
 
   if (slot.audio) {
     /* —— 音频+图片模式（支持精准同步进场） ——
@@ -448,16 +489,13 @@ async function startPlay(slot, opts = {}) {
 
 const startBtn = document.getElementById("start-btn");
 async function tryPlay(el) {
-  let started = false;
-  try { await el.play(); started = true; } catch (e) { /* 尝试静音 */ }
-  if (!started) {
-    try { el.muted = true; await el.play(); started = true; } catch (e) { /* 静音也被禁 */ }
-  }
-  if (!started) {
-    /* 明确被拒：直接给手动按钮 */
-    setBuffering(false);
-    startBtn.hidden = false;
-    return;
+  let refused = false;
+  try { await el.play(); } catch (e) { refused = !!(e && e.name === "NotAllowedError"); }
+  if (refused && !el.muted) {
+    /* 浏览器拒绝"有声自动播放"：先静音把画面走起来，声音交给画面上的"开声音"按钮 */
+    el.muted = true;
+    if (el === media) updateMuteBadge();
+    try { await el.play(); } catch (e) { /* 静音也被拒：交给看门狗和手动按钮 */ }
   }
   /* 关键兜底：play 请求可能长时间挂起（不算失败、不走 catch），
      12 秒后仍未真正开播就给出手动按钮 */
@@ -468,14 +506,11 @@ async function tryPlay(el) {
     }
   }, 12000);
 }
-startBtn.addEventListener("click", async () => {
+startBtn.addEventListener("click", () => {
   startBtn.hidden = true;
-  try {
-    await media.play();
-  } catch (e) {
-    media.muted = true;
-    media.play().catch(() => {});
-  }
+  media.muted = false; /* 用户亲手点的：按有声处理 */
+  updateMuteBadge();
+  ensurePlaying(media);
 });
 
 /* ---------- 双播放器无缝接力 ---------- */
@@ -489,6 +524,16 @@ function setFrontEl(el) {
 }
 /* 后台预载下一段：临近段尾（剩余<90s）才开始，避免整段全速下载与前台抢带宽 */
 let standbyArmedIdx = -1; /* 已为哪个分段索引预载过待命段 */
+/* 当前播放位置之后已缓冲的秒数（当前位置不在任何缓冲区间内时为 0） */
+function bufferAheadOf(el) {
+  try {
+    const b = el.buffered;
+    for (let i = 0; i < b.length; i++) {
+      if (b.start(i) <= el.currentTime && el.currentTime < b.end(i)) return b.end(i) - el.currentTime;
+    }
+  } catch (e) {}
+  return 0;
+}
 function loadStandbyNext(force = false) {
   if (!standbyEl || playing === false || !queue.length) return;
   const next = queue[queueIndex + 1];
@@ -496,7 +541,11 @@ function loadStandbyNext(force = false) {
   if (standbyArmedIdx === queueIndex) return; /* 本段已预载过 */
   if (!force) {
     if (!isFinite(media.duration)) return;
-    if (media.duration - media.currentTime > 150) return; /* 未到预载窗口：先让前台独占带宽（拥塞线路需要更长预热） */
+    const remaining = media.duration - media.currentTime;
+    if (remaining > 150) return; /* 未到预载窗口：先让前台独占带宽（拥塞线路需要更长预热） */
+    /* 带宽让位：前台自己的缓冲还不足 15 秒、且离段尾还远时，先把带宽留给前台；
+       缓冲够了（或马上就到段尾）再预载下一段 */
+    if (remaining > 30 && bufferAheadOf(media) < 15) return;
   }
   standbyArmedIdx = queueIndex;
   const url = mediaUrl(next);
@@ -607,46 +656,89 @@ async function swapToStandby() {
 async function playCurrentPart(startAt = 0) {
   playerState.textContent = queue.length > 1 ? `播放中 ${queueIndex + 1}/${queue.length}` : "播放中";
   const url = mediaUrl(queue[queueIndex]);
-  if (media.src !== url) media.src = queue[queueIndex]; /* 已预载则不重载 */
+  if (media.src !== url) {
+    lastDataAt = Date.now();
+    starveStarted = 0;
+    bufHist.length = 0;
+    media.src = queue[queueIndex]; /* 已预载则不重载 */
+  }
   if (startAt > 0) {
-    media.addEventListener("loadedmetadata", () => { media.currentTime = startAt; }, { once: true });
+    joinPending = true; /* 定位完成前 currentTime 还停在 0，不能拿它去算"落后多少" */
+    const seekWhenReady = () => { try { media.currentTime = startAt; } catch (e) {} };
+    if (media.readyState >= 1) seekWhenReady(); /* 已预载好的播放器不会再触发 loadedmetadata */
+    else media.addEventListener("loadedmetadata", seekWhenReady, { once: true });
   }
   await tryPlay(media);
 }
 
-/* ---------- 直播同步校准（防缓冲造成的漂移；视频模式可跨段校正） ---------- */
-setInterval(() => {
-  if (!playing || !liveMode || media.paused) return;
-  const target = (Date.now() - sessionStartMs) / 1000;
-  if (!currentSlot) return;
-  if (currentSlot.audio) {
-    if (isFinite(media.duration) && target < media.duration && Math.abs(media.currentTime - target) > 15) {
-      media.currentTime = target;
-    }
-  } else if (currentSlot.partDurations && queue.length) {
-    /* 换算目标时间所在分段与段内偏移 */
-    let acc = 0, idx = 0, offset = target;
-    for (let i = 0; i < currentSlot.partDurations.length; i++) {
-      if (target < acc + currentSlot.partDurations[i]) { idx = i; offset = target - acc; break; }
-      acc += currentSlot.partDurations[i];
-      idx = i + 1;
-      offset = 0;
-    }
-    if (idx >= queue.length) { finishSession(); return; } /* 直播时刻已过本场结尾 */
-    if (idx !== queueIndex) {
-      if (prerollOn) { /* 跨段校正接管：作废预滚，防其回调二次交接 */
-        prerollOn = false;
-        clearInterval(prerollWatchTimer);
-        try { standbyEl.pause(); } catch (e) {}
+/* ---------- 直播同步：在不打断播放的前提下向统一进度靠拢（每 2 秒看一次） ----------
+   统一进度 = 当前时间 - 开播时刻。进度落后通常是"进场/缓冲花掉的时间"造成的。
+   · 落后不超过 LIVE_TOLERANCE 秒：不管（几秒的差距属正常）
+   · 落后较多：只在"要跳过去的位置已经缓冲好"时才往前跳——跳转不会触发加载、不会卡；
+     缓冲不够就先照常播，等缓冲追上来再分几步补上
+   · 落后超过 LIVE_HARD_RESYNC 秒（长时间切后台/锁屏/断网）：直接跳到直播位置（允许等加载）
+   · 时钟已过本场结尾而画面还没播完：让视频自然播完，不掐断 */
+const LIVE_TOLERANCE = 12;      /* 秒：落后在此以内不做任何调整 */
+const LIVE_HARD_RESYNC = 120;   /* 秒：落后超过它就直接跳到直播位置 */
+const LIVE_JUMP_MIN_GAIN = 6;   /* 秒：一次前跳至少要缩短这么多，太碎的小跳不做 */
+const LIVE_JUMP_EDGE = 2.0;     /* 秒：落点离缓冲区末尾至少留这么多，跳过去立刻够得着 */
+
+/* 把"本场已播秒数"换算成第几段的第几秒 */
+function locateInQueue(t) {
+  const durs = (currentSlot && currentSlot.partDurations) || [];
+  let acc = 0;
+  for (let i = 0; i < durs.length; i++) {
+    if (t < acc + durs[i]) return { idx: i, offset: t - acc };
+    acc += durs[i];
+  }
+  return { idx: queue.length, offset: 0 };
+}
+/* 当前画面相对统一进度落后了多少秒（负数 = 跑到了时钟前面） */
+function liveBehindSec() {
+  if (!currentSlot || !currentSlot.partDurations) return 0;
+  let acc = 0;
+  for (let i = 0; i < queueIndex && i < currentSlot.partDurations.length; i++) acc += currentSlot.partDurations[i];
+  const pos = acc + (isFinite(media.currentTime) ? media.currentTime : 0);
+  return (Date.now() - sessionStartMs) / 1000 - pos;
+}
+function liveSeekTo(offset) {
+  try { media.currentTime = Math.min(offset, Math.max(0, (isFinite(media.duration) ? media.duration : offset) - 0.3)); } catch (e) {}
+  starveStarted = 0; /* 这是有意跳转：缓冲耗尽的计时重新开始 */
+}
+function syncToLive(allowPaused) {
+  if (!playing || !liveMode || !currentSlot || currentSlot.audio) return;
+  if (!queue.length || !currentSlot.partDurations) return;
+  if (prerollOn || joinPending || media.seeking || media.ended) return; /* 正在交接/进场定位/跳转/已到段尾：不去插手 */
+  if (media.paused && !allowPaused) return;
+  const loc = locateInQueue((Date.now() - sessionStartMs) / 1000);
+  if (loc.idx >= queue.length) return; /* 时钟已过结尾：让画面自然播完 */
+  const behind = liveBehindSec();
+  if (behind <= LIVE_TOLERANCE) return;
+  if (loc.idx === queueIndex) {
+    if (behind > LIVE_HARD_RESYNC) { liveSeekTo(loc.offset); return; }
+    /* 软追赶：在已缓冲的范围里，找"不超过统一进度、离它最近"的落点 */
+    let best = null;
+    try {
+      const b = media.buffered;
+      for (let i = 0; i < b.length; i++) {
+        const cand = Math.min(loc.offset, b.end(i) - LIVE_JUMP_EDGE);
+        if (cand > b.start(i) && cand > media.currentTime + LIVE_JUMP_MIN_GAIN && (best === null || cand > best)) best = cand;
       }
-      queueIndex = idx;
+    } catch (e) {}
+    if (best !== null) { try { media.currentTime = best; } catch (e) {} }
+    return;
+  }
+  if (loc.idx > queueIndex) {
+    /* 统一进度在后面的分段里：落后很多就直接切过去；否则等自然交接，到了新段再按上面的规则追 */
+    if (behind > LIVE_HARD_RESYNC) {
+      queueIndex = loc.idx;
       applyStripLayout();
-      swapToStandby().then(() => { playCurrentPart(offset); loadStandbyNext(); });
-    } else if (isFinite(video.duration) && Math.abs(video.currentTime - offset) > 15) {
-      video.currentTime = offset;
+      swapToStandby().then(() => { try { media.pause(); } catch (e) {} playCurrentPart(loc.offset); loadStandbyNext(); });
     }
   }
-}, 15000);
+  /* 画面跑到时钟前面（设备时间被改等）：不处理 */
+}
+setInterval(() => syncToLive(false), 2000);
 
 /* ---------- 共用媒体事件（video 与 audio 都挂载） ---------- */
 function onMediaEvent(el) {
@@ -675,32 +767,15 @@ function onMediaEvent(el) {
   el.addEventListener("ended", () => {
     if (media !== el || !playing) return;
     if (!currentSlot.audio && queueIndex < queue.length - 1) {
-      queueIndex += 1;
-      /* ended 冷路径接管：作废预滚（其回调有 prerollOn 守卫，不会二次交接） */
-      prerollOn = false;
-      clearInterval(prerollWatchTimer);
-      freezeStripFrame(media); /* 冷切换加载期间垫住字幕条 */
-      applyStripLayout();
-      /* 无缝接力：同步换轨（已预载+预热），零间隙零微任务延迟 */
-      const old = media;
-      media = standbyEl;
-      standbyEl = old;
-      old.pause();
-      media.muted = old.muted;
-      media.volume = old.volume;
-      setFrontEl(media);
-      playerState.textContent = queue.length > 1 ? `播放中 ${queueIndex + 1}/${queue.length}` : "播放中";
-      media.play().catch(() => {
-        media.muted = true;
-        media.play().catch(() => {});
-      });
-      loadStandbyNext();
+      advanceToNextPart();
       return;
     }
     finishSession();
   });
   el.addEventListener("volumechange", () => { if (media === el) updateMuteBadge(); });
   el.addEventListener("waiting", () => { if (media === el) setBuffering(true); });
+  /* 记录"最近一次收到数据"的时刻：看门狗据此判断连接是死是活（慢网读视频头期间不算卡死） */
+  el.addEventListener("progress", () => { if (media === el) lastDataAt = Date.now(); });
   /* 缓冲进度：显示已缓冲秒数，区分"在加载"与"卡死" */
   el.addEventListener("progress", () => {
     if (media !== el || !isFinite(el.duration) || bufferingEl.hidden) return;
@@ -724,6 +799,9 @@ function onMediaEvent(el) {
     setBuffering(false);
     startBtn.hidden = true;
     pauseRescueTried = 0; /* 恢复正常播放：重置救治等级 */
+    errRetries = 0;
+    joinPending = false; /* 进场定位完成，同步逻辑可以开始工作 */
+    firstByteWaitMs = 6000;
     playerWrap.classList.remove("preload-visual"); /* 正式开场：字幕/光芒/推镜一起启动 */
     if (!currentSlot || !currentSlot.audio) loadStandbyNext(); /* 开播即让后台预载下段 */
   });
@@ -734,12 +812,50 @@ function onMediaEvent(el) {
     }
   });
   el.addEventListener("canplay", () => { if (media === el) setBuffering(false); });
+  /* 加载出错（连接被断、服务器报错等）：不等看门狗，直接换连接重连 */
+  el.addEventListener("error", () => {
+    const code = el.error ? el.error.code : 0;
+    if (el !== media) {
+      /* 待命播放器预载失败：清掉，稍后重新预载 */
+      if (code !== 1) { standbyArmedIdx = -1; try { el.removeAttribute("src"); el.load(); } catch (e) {} }
+      return;
+    }
+    if (!playing || code === 1) return; /* MEDIA_ERR_ABORTED：我们自己换源造成的，不算错 */
+    errRetries += 1;
+    lastDataAt = Date.now(); /* 这次重连交给这里处理，看门狗先别插手 */
+    if (errRetries > 8) { setBuffering(false); startBtn.hidden = false; return; }
+    const at = el.currentTime;
+    showToast("网络中断，正在重连续播", "info", 2500);
+    setTimeout(() => { if (playing && media === el) recoverStall(at); }, 1500);
+  });
 }
 onMediaEvent(video);
 onMediaEvent(video2);
 onMediaEvent(audioEl);
 
+/* 冷路径接力：当前段已播完，切到后台播放器播下一段（下一段通常已预载好） */
+function advanceToNextPart() {
+  if (queueIndex >= queue.length - 1) return;
+  queueIndex += 1;
+  /* 作废预滚（其回调有 prerollOn 守卫，不会二次交接） */
+  prerollOn = false;
+  clearInterval(prerollWatchTimer);
+  freezeStripFrame(media); /* 冷切换加载期间垫住字幕条 */
+  applyStripLayout();
+  const old = media;
+  media = standbyEl;
+  standbyEl = old;
+  old.pause();
+  media.muted = old.muted;
+  media.volume = old.volume;
+  setFrontEl(media);
+  playerState.textContent = queue.length > 1 ? `播放中 ${queueIndex + 1}/${queue.length}` : "播放中";
+  ensurePlaying(media);
+  loadStandbyNext();
+}
+
 function finishSession() {
+  joinPending = false;
   prerollOn = false;
   clearInterval(prerollWatchTimer);
   standbyArmedIdx = -1;
@@ -827,7 +943,7 @@ function wxReady(cb) {
 wxReady(() => {
   setTimeout(() => {
     if (playing && media && media.paused && media.src) {
-      media.play().catch(() => {});
+      ensurePlaying(media);
     }
   }, 50);
 });
@@ -864,32 +980,21 @@ async function requestWakeLock() {
     wakeHint.textContent = "屏幕常亮开启失败，建议手动设置设备不休眠";
   }
 }
-/* 回前台恢复：直播模式先校准到全群统一时间线（now - 开播时刻），再续播 */
+/* 回前台恢复：先把进度对齐到全群统一的时间线（规则见 syncToLive），再续播 */
 function resumeAfterBackground() {
   if (!playing || !currentSlot || !media.src) return;
   setTimeout(() => {
-    if (!playing || media.paused === false || !media.src) return;
-    if (media.ended && !liveMode) return; /* 测试模式已自然播完不复活 */
-    if (liveMode) {
-      /* 直播同步：跳到所有人一致的时间点，而不是从暂停处继续 */
-      const target = (Date.now() - sessionStartMs) / 1000;
-      if (target >= sessionDurationSec(currentSlot)) { finishSession(); return; }
-      try {
-        media.currentTime = Math.min(target, Math.max(0, (isFinite(media.duration) ? media.duration : target) - 0.5));
-      } catch (e) { /* seek 失败则原位续播 */ }
-    } else if (media.ended) {
+    if (!playing || !media.paused || !media.src) return;
+    if (!liveMode && media.ended) return; /* 测试模式已自然播完不复活 */
+    if (liveMode && (Date.now() - sessionStartMs) / 1000 >= sessionDurationSec(currentSlot)) { finishSession(); return; }
+    if (media.ended) {
+      /* 在后台时这一段正好播完了：先接到下一段，之后由 syncToLive 对齐进度 */
+      if (queueIndex < queue.length - 1) advanceToNextPart();
+      else finishSession();
       return;
     }
-    media.play().catch(() => {
-      /* 自动续播被拒（iOS 未获得手势授权）：静音续播保画面，提示点开声音 */
-      media.muted = true;
-      media.play().then(() => {
-        updateMuteBadge();
-        showToast("已恢复播放（静音），点击画面开声音", "info", 4000);
-      }).catch(() => {
-        startBtn.hidden = false; /* 彻底被禁：给手动按钮 */
-      });
-    });
+    syncToLive(true);
+    ensurePlaying(media);
     /* 视频模式顺带确认后台预载还在 */
     if (!currentSlot.audio && queue.length > 1) loadStandbyNext();
   }, 200);
@@ -903,7 +1008,7 @@ document.addEventListener("visibilitychange", () => {
 window.addEventListener("pageshow", (e) => {
   if (e.persisted) resumeAfterBackground();
   else if (playing && media.src && media.paused && !media.ended) {
-    media.play().catch(() => {});
+    ensurePlaying(media);
   }
 });
 
