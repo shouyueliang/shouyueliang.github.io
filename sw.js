@@ -5,7 +5,7 @@
    ========================================================== */
 "use strict";
 
-const CACHE = "jjq-toolbox-v41";
+const CACHE = "jjq-toolbox-v42";
 const PRECACHE = [
   "./",
   "./index.html",
@@ -67,6 +67,10 @@ self.addEventListener("fetch", (e) => {
   if (e.request.method !== "GET") return;
   const url = new URL(e.request.url);
   if (url.origin !== location.origin) return;
+  /* 视频/音频的分段（Range）请求不经过这里，交给浏览器直接取：
+     经 Service Worker 中转的范围请求会间歇性出现"有响应头却不出数据"的卡死，
+     而且分段响应(206)本来也无法写入缓存，中转没有任何好处 */
+  if (e.request.headers.has("range")) return;
 
   const isDocLike =
     e.request.mode === "navigate" ||
