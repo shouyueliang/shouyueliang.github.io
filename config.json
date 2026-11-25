@@ -69,9 +69,5 @@
       "stripFrom": 1,
       "stripTo": 11
     }
-  ],
-  "mirrors": [
-    "https://shouyueliang.github.io/",
-    "https://shouyueliang.pages.dev/"
   ]
 }

@@ -28,7 +28,6 @@ const SESSION_TAIL_SEC = 120; /* 结束后的缓冲窗口 */
 
 let SCHEDULE = DEFAULT_SCHEDULE;
 let GRACE_MIN = DEFAULT_GRACE_MIN;
-let MIRRORS = []; /* 备用线路基地址（config.json mirrors），主线路拥堵时轮换 */
 
 /* ---------- 元素 ---------- */
 const video = document.getElementById("video");
@@ -78,26 +77,13 @@ let currentBgKey = "";             // 当前背景段标识
 let frontBg = bgSc;                // 背景交叉淡入的前层
 let soloMode = false;              // 当前背景段是否为整幅场景（片头/结尾，无字幕条）
 
-/* ---------- 线路与地址：本站在首位，mirrors 依次补充；轮换时跳过自身 ---------- */
-let baseIdx = 0;
-function lineOrigins() {
-  const list = [location.origin];
-  for (const m of MIRRORS) {
-    try {
-      const o = new URL(m).origin;
-      if (o !== location.origin && !list.includes(o)) list.push(o);
-    } catch (e) { /* 忽略无效镜像 */ }
-  }
-  return list;
-}
+/* ---------- 媒体地址：一律取本站（GitHub Pages），不切换线路 ---------- */
 function mediaUrl(rel) {
-  const bases = lineOrigins();
-  const b = bases[Math.min(baseIdx, bases.length - 1)] || bases[0];
-  return new URL(rel, b + "/").href;
+  return new URL(rel, location.origin + "/").href;
 }
 
 /* ---------- 卡死/龟速/静默暂停 自愈看门狗 ----------
-   ① 30s 窗口进度<5s（龟速/停顿）→ 换线路重连续播
+   ① 30s 窗口进度<5s（龟速/停顿）→ 原地址重连续播
    ② 播放中却处于暂停态（play被拒等）→ 自动续播，失败降级静音续播，再失败给手动按钮 */
 let stallTicks = []; /* [{t:墙钟ms, p:播放位置}] 滑动窗口 */
 let pauseRescueTried = 0;
@@ -124,7 +110,7 @@ setInterval(() => {
     return;
   }
   pauseRescueTried = 0;
-  /* waiting/stalled 但未暂停（readyState<3 且缓冲耗尽）：计时，10 秒仍无数据也换线 */
+  /* waiting/stalled 但未暂停（readyState<3 且缓冲耗尽）：计时，10 秒仍无数据也重连 */
   const starving = media.readyState < 3;
   if (starving && !starveStarted) starveStarted = Date.now();
   if (!starving) starveStarted = 0;
@@ -141,7 +127,7 @@ setInterval(() => {
   const first = stallTicks[0];
   const spanMs = now - first.t;
   const prog = p - first.p;
-  if (spanMs >= 30000 && prog < 5) { /* 30 秒只走了不到 5 秒：龟速/停顿，换线 */
+  if (spanMs >= 30000 && prog < 5) { /* 30 秒只走了不到 5 秒：龟速/停顿，重连 */
     stallTicks = [];
     recoverStall(p);
   }
@@ -153,13 +139,10 @@ function recoverStall(t) {
   standbyArmedIdx = -1;
   try { standbyEl.pause(); } catch (e) {}
   freezeStripFrame(media); /* 垫住字幕条，重连期间画面完整 */
-  /* 轮换到下一条线路（跳过自身之外的可用线路），带 cache-bust 重开连接 */
-  baseIdx = (baseIdx + 1) % Math.max(1, lineOrigins().length);
-  const which = baseIdx === 0 ? "主线路" : `备用线路 ${baseIdx}`;
-  showToast(`网络波动，已切换到${which}续播`, "info", 3000);
+  /* 原地址重连：只走本站（GitHub），不换线、不带防缓存参数 */
   const wasMuted = media.muted;
   const url = mediaUrl(queue[queueIndex] || (currentSlot && currentSlot.videos && currentSlot.videos[0]) || "");
-  media.src = url + (url.includes("?") ? "&" : "?") + "rs=" + Date.now();
+  media.src = url;
   const onMeta = () => {
     media.removeEventListener("loadedmetadata", onMeta);
     try { media.currentTime = Math.min(t, Math.max(0, (isFinite(media.duration) ? media.duration : t) - 0.3)); } catch (e) {}
@@ -171,8 +154,8 @@ function recoverStall(t) {
   setTimeout(() => {
     if (playing && media.paused) { pauseRescueTried = 0; hardResume(); }
   }, 6000);
-  /* 终极兜底：换线后 25 秒仍没走出卡点（数据还没到播放位置）→ 再换下一条线重试，
-     看门狗会因进度停滞再次触发本函数，形成"循环换线直到通"的效果 */
+  /* 终极兜底：重连后 25 秒仍没走出卡点（数据还没到播放位置）→ 再重连一次，
+     看门狗会因进度停滞再次触发本函数，形成"循环重连直到通"的效果 */
   setTimeout(() => {
     if (playing && !media.paused && media.currentTime < t + 2) {
       stallTicks = [];
@@ -322,7 +305,7 @@ function prefetchUpcomingScenes(t) {
   }
 }
 
-/* ---------- 字幕条冻结帧：加载/换线期间用画布垫住下1/3，画面不缺角 ----------
+/* ---------- 字幕条冻结帧：加载/重连期间用画布垫住下1/3，画面不缺角 ----------
    注意：drawImage 跨域视频会污染画布（画出来是空白且不报错），所以先用
    captureStream 不现实；改为只在同源时绘制，跨域一律跳过（宁缺勿白板） */
 function freezeStripFrame(el) {
@@ -1123,7 +1106,6 @@ fetch(new Request("config.json", { cache: "no-store" }))
       SCHEDULE = cfg.schedule;
       GRACE_MIN = typeof cfg.graceMin === "number" && cfg.graceMin > 0 ? cfg.graceMin : DEFAULT_GRACE_MIN;
     }
-    if (cfg && Array.isArray(cfg.mirrors)) MIRRORS = cfg.mirrors.filter((m) => typeof m === "string" && m);
   })
   .catch(() => { /* 离线或缺失：使用默认 */ })
   .finally(initApp);
