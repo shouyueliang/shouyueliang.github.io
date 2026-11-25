@@ -1310,7 +1310,11 @@ function showToast(message, type = "info", duration = 2600) {
 /* ---------- Service Worker（PWA 离线 + 版本自愈） ---------- */
 if ("serviceWorker" in navigator && /^https?:$/.test(location.protocol)) {
   window.addEventListener("load", () => {
-    navigator.serviceWorker.register("sw.js").catch(() => {});
+    navigator.serviceWorker.register("sw.js")
+      /* 浏览器对缓存脚本的更新检查有节流（不是每次打开都查）；这里每次打开都主动查一次，
+         让线上的修复在下一次打开页面时就能到达已访问过的人 */
+      .then((reg) => { reg.update().catch(() => {}); })
+      .catch(() => {});
   });
   let swReloaded = false;
   let swReloadPending = false; /* 播放中遇到更新：推迟到本场结束再刷新 */
